@@ -1,0 +1,4 @@
+/jetson-inference/another/CUDA-PointPillars/build/CMakeFiles/pointpillar_core.dir
+/jetson-inference/another/CUDA-PointPillars/build/CMakeFiles/pointpillar.dir
+/jetson-inference/another/CUDA-PointPillars/build/CMakeFiles/edit_cache.dir
+/jetson-inference/another/CUDA-PointPillars/build/CMakeFiles/rebuild_cache.dir

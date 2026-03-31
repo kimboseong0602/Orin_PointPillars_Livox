@@ -1,0 +1,2 @@
+/usr/bin/ar qc libpointpillar_core.a CMakeFiles/pointpillar_core.dir/src/pointpillar.cpp.o CMakeFiles/pointpillar_core.dir/src/preprocess.cpp.o CMakeFiles/pointpillar_core.dir/src/postprocess.cpp.o CMakeFiles/pointpillar_core.dir/src/pillarScatter.cpp.o
+/usr/bin/ranlib libpointpillar_core.a

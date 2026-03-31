@@ -1,0 +1,5 @@
+[2025-09-01 09:18:08.343] [console] [info] set master/slave sdk to master sdk by default  [parse_cfg_file.cpp] [Parse] [82]
+[2025-09-01 09:18:08.343] [console] [info] Lidar log cfg, lidar_log_enable:true, lidar_log_cache_size_MB:500, lidar_log_path:./  [parse_cfg_file.cpp] [Parse] [116]
+[2025-09-01 09:18:08.343] [console] [info] Device type:9 point cloud data and IMU data unicast is enabled.  [params_check.cpp] [CheckLidarMulticastIp] [100]
+[2025-09-01 09:18:08.343] [console] [info] Data Handler Init Succ.  [data_handler.cpp] [Init] [49]
+[2025-09-01 09:18:08.344] [console] [info] Init livox lidars succ.  [device_manager.cpp] [Init] [178]

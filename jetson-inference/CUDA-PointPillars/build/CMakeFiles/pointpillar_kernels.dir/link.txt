@@ -1,0 +1,2 @@
+/usr/bin/ar qc libpointpillar_kernels.a CMakeFiles/pointpillar_kernels.dir/src/pointpillar_kernels_generated_preprocess_kernels.cu.o CMakeFiles/pointpillar_kernels.dir/src/pointpillar_kernels_generated_pillarScatterKernels.cu.o CMakeFiles/pointpillar_kernels.dir/src/pointpillar_kernels_generated_postprocess_kernels.cu.o
+/usr/bin/ranlib libpointpillar_kernels.a

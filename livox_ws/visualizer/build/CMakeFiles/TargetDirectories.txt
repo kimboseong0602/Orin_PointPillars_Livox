@@ -1,0 +1,3 @@
+/livox_ws/visualizer/build/CMakeFiles/pointcloud_read.dir
+/livox_ws/visualizer/build/CMakeFiles/edit_cache.dir
+/livox_ws/visualizer/build/CMakeFiles/rebuild_cache.dir

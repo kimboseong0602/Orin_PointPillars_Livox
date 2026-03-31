@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/pointcloud_read.dir/main.cpp.o -o pointcloud_read  /livox_ws/Livox-SDK/build/sdk_core/liblivox_sdk_static.a -ldl -lpthread 
