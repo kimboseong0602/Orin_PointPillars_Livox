@@ -1,0 +1,648 @@
+// Livox Mid-70 realtime visualizer + PointPillars RT (OpenCV)
+// Controls: A/D yaw, E/R zoom, 1/2 point size, [/ ] accumulation window,
+//           C color mode, B toggle boxes, SPACE auto-spin, S save, Q/ESC quit
+
+#include <iostream>
+#include <fstream>
+#include <deque>
+#include <vector>
+#include <atomic>
+#include <mutex>
+#include <csignal>
+#include <chrono>
+#include <thread>
+#include <cmath>
+#include <algorithm>
+#include <cstdio>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#include "livox_sdk.h"          // Livox SDK v2
+#include <opencv2/opencv.hpp>   // OpenCV HighGUI
+
+// PointPillars
+#include "./include/params.h"     // Bndbox 등 정의
+#include "./include/pointpillar.h"
+
+using Clock = std::chrono::steady_clock;
+static inline uint64_t now_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+           Clock::now().time_since_epoch()).count();
+}
+static constexpr float PI_F = 3.14159265358979323846f;
+
+// ========== 시각화/추론 파라미터 (★ 기존 Params와 충돌 방지 위해 개명) ==========
+struct VisParams {
+  // 시각화 공용
+  std::string out_dir = "out_frames";
+  int   width = 1280, height = 720;
+  int   fps = 30;
+  float fov_deg = 40.0f;        // 시야각(작을수록 줌인)
+  float xyz_scale = 0.001f;     // mm→m
+  bool  norm_intensity = true;  // 0..255 → 0..1
+  int   accum_ms = 600;         // 누적 윈도우(ms)
+  int   duration_s = 0;         // 0이면 무제한
+
+  // 카메라 (기본 고정)
+  float cam_radius = 3.5f;
+  float cam_height = 1.6f;
+  float spin_deg_per_s = 12.0f; // 자동 회전 속도(0이면 정지)
+  bool  autofit = true;         // 포인트에 자동 맞춤 시점
+
+  // 퍼스펙티브 렌더 튜닝
+  int   point_px = 3;               // 포인트 반경(픽셀)
+  bool  color_by_height = true;     // true=높이 컬러, false=강도 그레이
+  float z_min = -1.0f, z_max = 2.0f;// 높이 컬러 범위(자동계산 쓰려면 이 값 무시)
+  float gamma = 0.7f;               // 강도 감마
+
+  // ── Top-view 옵션
+  bool  topview_on = true;          // 탑뷰도 표시
+  float top_xmin = -30.f, top_xmax = 30.f; // [m]
+  float top_ymin = -30.f, top_ymax = 30.f; // [m]
+  int   top_ppm  = 40;              // pixels per meter
+  int   top_point_px = 2;           // 포인트 반경(픽셀)
+  bool  top_color_by_height = false;// false=강도, true=높이 컬러
+  float top_zmin = -1.f, top_zmax = 2.f;   // 높이 컬러 범위
+  float top_gamma = 0.7f;           // 강도 감마
+
+  // ── PointPillars 추론 관련
+  std::string onnx_path = "./model/pointpillar.onnx";
+  int   infer_hz = 10;              // 추론 주기(Hz)
+  // ROI 필터(추론 입력을 줄이기 위해 사용, KITTI 스타일 전방 영역)
+  float roi_xmin = 0.f,  roi_xmax = 70.f;
+  float roi_ymin = -40.f, roi_ymax = 40.f;
+  float roi_zmin = -3.f, roi_zmax = 1.f;
+
+  bool  draw_boxes = true;          // 탑뷰에 박스 표시
+} g_v;
+
+struct TimedPt { float x,y,z,i; uint64_t t; };
+
+static std::deque<TimedPt> g_buf;           // 시각화용 슬라이딩 포인트 버퍼
+static std::mutex g_mtx;
+static std::atomic<bool> g_run{true};
+
+static std::vector<Bndbox> g_boxes;         // 최신 추론 박스
+static std::mutex g_box_mtx;
+
+static void SigInt(int){ g_run.store(false); }
+
+// ========== 유틸 ==========
+static inline float clamp01(float x){ return x<0.f?0.f:(x>1.f?1.f:x); }
+
+static void hsv2rgb(float h, float s, float v, uint8_t& R, uint8_t& G, uint8_t& B){
+  h = std::fmod(std::fabs(h), 360.f);
+  float c = v * s;
+  float x = c * (1 - std::fabs(std::fmod(h/60.f, 2.f)-1));
+  float m = v - c;
+  float r=0,g=0,b=0;
+  if(h<60){ r=c; g=x; b=0; }
+  else if(h<120){ r=x; g=c; b=0; }
+  else if(h<180){ r=0; g=c; b=x; }
+  else if(h<240){ r=0; g=x; b=c; }
+  else if(h<300){ r=x; g=0; b=c; }
+  else { r=c; g=0; b=x; }
+  R=(uint8_t)std::round((r+m)*255); G=(uint8_t)std::round((g+m)*255); B=(uint8_t)std::round((b+m)*255);
+}
+
+static bool ensure_dir(const std::string& dir) {
+  struct stat st{};
+  if (stat(dir.c_str(), &st)==0) return S_ISDIR(st.st_mode);
+  return mkdir(dir.c_str(), 0755)==0;
+}
+
+static bool save_ppm(const std::string& path, int W, int H, const std::vector<uint8_t>& rgb) {
+  if ((int)rgb.size() != W*H*3) return false;
+  std::ofstream f(path, std::ios::binary);
+  if (!f) return false;
+  f << "P6\n" << W << " " << H << "\n255\n";
+  f.write(reinterpret_cast<const char*>(rgb.data()), rgb.size());
+  return f.good();
+}
+
+// ========== 카메라/변환 ==========
+struct Mat3 { float m[3][3]; };
+struct Vec3 { float x,y,z; };
+static inline Vec3 cross(const Vec3&a,const Vec3&b){return {a.y*b.z-a.z*b.y,a.z*b.x-a.x*b.z,a.x*b.y-a.y*b.x};}
+static inline float dot(const Vec3&a,const Vec3&b){return a.x*b.x+a.y*b.y+a.z*b.z;}
+static inline Vec3 normv(const Vec3&a){ float l=std::sqrt(dot(a,a)); return l>1e-9f?Vec3{a.x/l,a.y/l,a.z/l}:Vec3{0,0,0}; }
+
+struct View { Mat3 R; Vec3 t; }; // world→cam: Xc = R*(X - eye)
+
+static View look_at(const Vec3& eye, const Vec3& target, const Vec3& up={0,0,1}) {
+  Vec3 f = normv({target.x-eye.x, target.y-eye.y, target.z-eye.z}); // forward(+Z)
+  Vec3 r = normv(cross(f, up));                                     // right(+X)
+  Vec3 u = cross(r, f);                                             // up(+Y)
+  Mat3 R = {{ { r.x, r.y, r.z },
+              { u.x, u.y, u.z },
+              { f.x, f.y, f.z } }};
+  return {R, eye};
+}
+
+static inline Vec3 world2cam(const View& V, const Vec3& Xw) {
+  Vec3 d = {Xw.x - V.t.x, Xw.y - V.t.y, Xw.z - V.t.z};
+  return { V.R.m[0][0]*d.x + V.R.m[0][1]*d.y + V.R.m[0][2]*d.z,
+           V.R.m[1][0]*d.x + V.R.m[1][1]*d.y + V.R.m[1][2]*d.z,
+           V.R.m[2][0]*d.x + V.R.m[2][1]*d.y + V.R.m[2][2]*d.z };
+}
+
+// ========== Livox 콜백 ==========
+static const char* devTypeName(uint8_t t) {
+  switch (t) {
+    case 0: return "Hub";
+    case 1: return "Mid-40";
+    case 2: return "Tele-15";
+    case 3: return "Horizon";
+    case 4: return "Avia";
+    case 6: return "Mid-70";
+    default: return "Unknown";
+  }
+}
+
+static void OnCmdAck(livox_status status, uint8_t handle, uint8_t, void*) {
+  std::fprintf(stderr, "[CMD] handle=%u status=%d\n", handle, int(status));
+}
+
+static void OnData(uint8_t, LivoxEthPacket* pkt, uint32_t n, void*) {
+  if (!pkt || n==0) return;
+  const float S = g_v.xyz_scale;
+  const bool normI = g_v.norm_intensity;
+  uint64_t t = now_ns();
+
+  std::lock_guard<std::mutex> lk(g_mtx);
+  if (pkt->data_type == kCartesian) {
+    const LivoxRawPoint* p = reinterpret_cast<const LivoxRawPoint*>(pkt->data);
+    for (uint32_t i=0;i<n;++i) {
+      float I = float(p[i].reflectivity); if (normI) I/=255.f;
+      g_buf.push_back({p[i].x*S, p[i].y*S, p[i].z*S, I, t});
+    }
+  } else if (pkt->data_type == kExtendCartesian) {
+    const LivoxExtendRawPoint* p = reinterpret_cast<const LivoxExtendRawPoint*>(pkt->data);
+    for (uint32_t i=0;i<n;++i) {
+      float I = float(p[i].reflectivity); if (normI) I/=255.f;
+      g_buf.push_back({p[i].x*S, p[i].y*S, p[i].z*S, I, t});
+    }
+  }
+  // 오래된 포인트 제거(슬라이딩 윈도우)
+  const uint64_t keep_ns = uint64_t(g_v.accum_ms) * 1000000ULL;
+  const uint64_t th = t > keep_ns ? t - keep_ns : 0;
+  while (!g_buf.empty() && g_buf.front().t < th) g_buf.pop_front();
+}
+
+static void OnBroadcast(const BroadcastDeviceInfo* info) {
+  if (!info) return;
+  std::fprintf(stderr, "[BC] code=%s  dev_type=%u(%s)\n",
+               info->broadcast_code, info->dev_type, devTypeName(info->dev_type));
+  uint8_t handle=0;
+  auto ret = AddLidarToConnect(info->broadcast_code, &handle);
+  std::fprintf(stderr, "[BC] AddLidarToConnect ret=%d handle=%u\n", int(ret), handle);
+}
+
+static void OnDeviceChange(const DeviceInfo* info, DeviceEvent ev) {
+  if (!info) return;
+  if (ev==kEventConnect) {
+    std::fprintf(stderr, "[STATE] connected handle=%u\n", info->handle);
+    SetDataCallback(info->handle, OnData, nullptr);
+    LidarStartSampling(info->handle, OnCmdAck, nullptr);
+  } else if (ev==kEventDisconnect) {
+    std::fprintf(stderr, "[STATE] disconnected handle=%u\n", info->handle);
+  } else if (ev==kEventStateChange) {
+    std::fprintf(stderr, "[STATE] state change handle=%u\n", info->handle);
+  }
+}
+
+// ========== 렌더: 퍼스펙티브(오토핏+Z-buffer+원형 스플랫+컬러) ==========
+static void render_perspective_to_rgb(const std::vector<TimedPt>& pts, float yaw_deg,
+                                      int W, int H, float fov_deg,
+                                      std::vector<uint8_t>& out_rgb) {
+  out_rgb.assign(W*H*3, 0);
+  if (pts.empty()) return;
+
+  // 1) 바운딩 박스/센터/스케일
+  float xmin=1e9f,xmax=-1e9f,ymin=1e9f,ymax=-1e9f,zmin=1e9f,zmax=-1e9f;
+  for (auto& p: pts) {
+    xmin = std::min(xmin,p.x); xmax = std::max(xmax,p.x);
+    ymin = std::min(ymin,p.y); ymax = std::max(ymax,p.y);
+    zmin = std::min(zmin,p.z); zmax = std::max(zmax,p.z);
+  }
+  Vec3 center = { (xmin+xmax)*0.5f, (ymin+ymax)*0.5f, (zmin+zmax)*0.5f };
+  float extent = std::max({xmax-xmin, ymax-ymin, std::max(0.5f, zmax-zmin)});
+
+  // 2) 카메라 계산
+  float yaw = yaw_deg * (PI_F/180.0f);
+  View V;
+  if (g_v.autofit) {
+    float dist = std::max(2.0f, extent * 1.2f / std::tan(fov_deg*(PI_F/180.0f)/2.f));
+    Vec3 eye = { center.x + dist*std::cos(yaw),
+                 center.y + dist*std::sin(yaw),
+                 center.z + std::max(1.0f, extent*0.3f) };
+    V = look_at(eye, center);
+  } else {
+    Vec3 eye = { g_v.cam_radius*std::cos(yaw), g_v.cam_radius*std::sin(yaw), g_v.cam_height };
+    V = look_at(eye, {0,0,0});
+  }
+
+  // 3) 투영
+  float fx = (W*0.5f)/std::tan(fov_deg*(PI_F/180.0f)/2.f);
+  float fy = fx, cx = W*0.5f, cy = H*0.5f;
+
+  // 4) 깊이 버퍼 + 스플랫 반경
+  std::vector<float> depth(W*H, 1e30f);
+  int R = std::max(1, g_v.point_px);
+
+  auto plot = [&](int u, int v, float z, uint8_t r,uint8_t g,uint8_t b){
+    if ((unsigned)u >= (unsigned)W || (unsigned)v >= (unsigned)H) return;
+    int idx = v*W + u;
+    if (z < depth[idx]) { depth[idx] = z; out_rgb[3*idx+0]=r; out_rgb[3*idx+1]=g; out_rgb[3*idx+2]=b; }
+  };
+
+  // 5) 컬러 범위
+  float zminC = g_v.z_min, zmaxC = g_v.z_max;
+  if (g_v.color_by_height && !(zmaxC > zminC)) { // 미지정 시 스냅샷 기반
+    zminC = zmin - 0.2f*extent; zmaxC = zmax + 0.2f*extent;
+  }
+
+  for (const auto& p : pts) {
+    Vec3 Xc = world2cam(V, {p.x,p.y,p.z});
+    if (Xc.z <= 0.05f) continue;
+
+    int u0 = int(fx*(Xc.x/Xc.z) + cx);
+    int v0 = int(fy*(Xc.y/Xc.z) + cy);
+
+    // 색상
+    uint8_t R8,G8,B8;
+    if (g_v.color_by_height) {
+      float t = clamp01((p.z - zminC) / std::max(1e-6f, (zmaxC - zminC)));
+      float h = (1.f - t) * 240.f; // 파랑→빨강
+      hsv2rgb(h, 1.f, 1.f, R8,G8,B8);
+    } else {
+      float v = clamp01(p.i);
+      v = std::pow(v, g_v.gamma);
+      uint8_t g8 = (uint8_t)std::round(v*255.f);
+      R8=g8; G8=g8; B8=g8;
+    }
+
+    // 원형 스플랫
+    for (int dv=-R; dv<=R; ++dv){
+      for (int du=-R; du<=R; ++du){
+        if (du*du + dv*dv > R*R) continue;
+        plot(u0+du, v0+dv, Xc.z, R8,G8,B8);
+      }
+    }
+  }
+}
+
+// ========== 렌더: 탑뷰(XY) ==========
+static void render_topdown_to_rgb(const std::vector<TimedPt>& pts,
+                                  std::vector<uint8_t>& out_rgb,
+                                  int& W, int& H) {
+  W = std::max(4, int((g_v.top_xmax - g_v.top_xmin) * g_v.top_ppm));
+  H = std::max(4, int((g_v.top_ymax - g_v.top_ymin) * g_v.top_ppm));
+  out_rgb.assign(W*H*3, 0);
+
+  std::vector<float> acc(W*H, 0.0f);
+  std::vector<float> accH; // 높이컬러용
+  if (g_v.top_color_by_height) accH.assign(W*H, 0.0f);
+
+  auto put_gray = [&](int u, int v, float val){
+    if ((unsigned)u >= (unsigned)W || (unsigned)v >= (unsigned)H) return;
+    float &pix = acc[v*W + u];
+    if (val > pix) pix = val;
+  };
+  auto put_hval = [&](int u, int v, float val){
+    if ((unsigned)u >= (unsigned)W || (unsigned)v >= (unsigned)H) return;
+    float &pix = accH[v*W + u];
+    if (val > pix) pix = val;
+  };
+
+  const int R = std::max(1, g_v.top_point_px);
+
+  for (const auto& p : pts) {
+    int u0 = int((p.x - g_v.top_xmin) * g_v.top_ppm);
+    int v0 = int((g_v.top_ymax - p.y) * g_v.top_ppm); // y flip (영상 좌표)
+    if ((unsigned)u0 >= (unsigned)W || (unsigned)v0 >= (unsigned)H) continue;
+
+    if (g_v.top_color_by_height) {
+      float t = clamp01( (p.z - g_v.top_zmin) / std::max(1e-6f, (g_v.top_zmax - g_v.top_zmin)) );
+      for (int dv=-R; dv<=R; ++dv)
+        for (int du=-R; du<=R; ++du)
+          if (du*du + dv*dv <= R*R) put_hval(u0+du, v0+dv, t);
+    } else {
+      float v = clamp01(p.i);
+      v = std::pow(v, g_v.top_gamma);
+      for (int dv=-R; dv<=R; ++dv)
+        for (int du=-R; du<=R; ++du)
+          if (du*du + dv*dv <= R*R) put_gray(u0+du, v0+dv, v);
+    }
+  }
+
+  if (g_v.top_color_by_height) {
+    for (int i=0;i<W*H;++i){
+      float t = clamp01(accH[i]);
+      float h = (1.f - t) * 240.f;
+      uint8_t R8,G8,B8; hsv2rgb(h, 1.f, 1.f, R8,G8,B8);
+      out_rgb[3*i+0]=R8; out_rgb[3*i+1]=G8; out_rgb[3*i+2]=B8;
+    }
+  } else {
+    for (int i=0;i<W*H;++i){
+      uint8_t g = (uint8_t)std::round(acc[i]*255.f);
+      out_rgb[3*i+0]=g; out_rgb[3*i+1]=g; out_rgb[3*i+2]=g;
+    }
+  }
+}
+
+// ========== PointPillars 추론 스레드 ==========
+static void infer_thread_fn() {
+  // CUDA stream 준비
+  cudaStream_t stream = nullptr;
+  cudaStreamCreate(&stream);
+  PointPillar pp(g_v.onnx_path, stream);
+
+  const double period_s = 1.0 / std::max(1, g_v.infer_hz);
+
+  std::vector<Bndbox> boxes_local;
+  boxes_local.reserve(128);
+
+  while (g_run.load()) {
+    auto t_start = Clock::now();
+
+    // 최신 포인트 스냅샷 (ROI 필터 적용)
+    std::vector<TimedPt> pts;
+    {
+      std::lock_guard<std::mutex> lk(g_mtx);
+      pts.assign(g_buf.begin(), g_buf.end());
+    }
+    std::vector<float> xyzi;
+    xyzi.reserve(pts.size()*4);
+    for (const auto& p : pts) {
+      if (p.x < g_v.roi_xmin || p.x > g_v.roi_xmax) continue;
+      if (p.y < g_v.roi_ymin || p.y > g_v.roi_ymax) continue;
+      if (p.z < g_v.roi_zmin || p.z > g_v.roi_zmax) continue;
+      xyzi.push_back(p.x);
+      xyzi.push_back(p.y);
+      xyzi.push_back(p.z);
+      xyzi.push_back(p.i);
+    }
+
+    // 최소 포인트 수 체크 (너무 적으면 스킵)
+    if (xyzi.size() >= 4*50) {
+      // UM 메모리로 복사
+      float* d = nullptr;
+      size_t bytes = xyzi.size()*sizeof(float);
+      cudaMallocManaged((void**)&d, bytes);
+      std::memcpy(d, xyzi.data(), bytes);
+      cudaDeviceSynchronize();
+
+      boxes_local.clear();
+      pp.doinfer(d, static_cast<unsigned int>(xyzi.size()/4), boxes_local);
+
+      cudaFree(d);
+
+      // 공유 결과 갱신
+      {
+        std::lock_guard<std::mutex> lk(g_box_mtx);
+        g_boxes = boxes_local;
+      }
+    }
+
+    // 주기 맞추기
+    auto t_end = Clock::now();
+    double dt_s = std::chrono::duration<double>(t_end - t_start).count();
+    double sleep_s = period_s - dt_s;
+    if (sleep_s > 0) std::this_thread::sleep_for(std::chrono::duration<double>(sleep_s));
+  }
+
+  cudaStreamDestroy(stream);
+}
+
+// ========== Top-view 박스 그리기 ==========
+static inline cv::Point2f world2pix(float x, float y) {
+  float u = (x - g_v.top_xmin) * g_v.top_ppm;
+  float v = (g_v.top_ymax - y) * g_v.top_ppm;
+  return {u, v};
+}
+
+static void draw_boxes_topview(cv::Mat& img, int W, int H) {
+  std::vector<Bndbox> boxes;
+  { std::lock_guard<std::mutex> lk(g_box_mtx); boxes = g_boxes; }
+
+  for (const auto& b : boxes) {
+    // Bndbox: x y z w l h rt id score
+    float cx = b.x, cy = b.y;
+    float Wm = b.w, Lm = b.l;    // KITTI: l(length)=Y, w(width)=X 사용 케이스가 많음
+    float yaw = b.rt;            // 라디안
+
+    cv::RotatedRect rr(
+      world2pix(cx, cy),
+      cv::Size2f(Lm * g_v.top_ppm, Wm * g_v.top_ppm),
+      -yaw * 180.0f / PI_F      // 화면 y축 flip 고려하여 부호 반전
+    );
+
+    // 박스 폴리곤
+    cv::Point2f pts[4];
+    rr.points(pts);
+    for (int i=0;i<4;i++) {
+      cv::line(img, pts[i], pts[(i+1)&3], cv::Scalar(0,255,255), 2, cv::LINE_AA);
+    }
+
+    // 헤딩 화살표 (front)
+    cv::Point2f c = rr.center;
+    cv::Point2f tip = c + cv::Point2f(std::cos(-yaw), -std::sin(-yaw)) * (Lm*0.5f*g_v.top_ppm);
+    cv::arrowedLine(img, c, tip, cv::Scalar(0,165,255), 2, cv::LINE_AA, 0, 0.25);
+
+    // 점수/ID
+    char txt[64];
+    std::snprintf(txt, sizeof(txt), "ID:%d  %.2f", b.id, b.score);
+    cv::putText(img, txt, c + cv::Point2f(5,-5), cv::FONT_HERSHEY_SIMPLEX, 0.4, {0,255,255}, 1, cv::LINE_AA);
+  }
+}
+
+// ========== 인자 파서 ==========
+static void parse_args(int argc, char** argv){
+  for (int i=1;i<argc;++i){
+    std::string a=argv[i];
+    auto nexti=[&](int& d){ if(i+1<argc) d=std::stoi(argv[++i]); };
+    auto nextf=[&](float& d){ if(i+1<argc) d=std::stof(argv[++i]); };
+    auto nexts=[&](std::string& d){ if(i+1<argc) d=argv[++i]; };
+    if(a=="--out_dir") nexts(g_v.out_dir);
+    else if(a=="--fps") nexti(g_v.fps);
+    else if(a=="--w") nexti(g_v.width);
+    else if(a=="--h") nexti(g_v.height);
+    else if(a=="--fov_deg") nextf(g_v.fov_deg);
+    else if(a=="--accum_ms") nexti(g_v.accum_ms);
+    else if(a=="--duration_s") nexti(g_v.duration_s);
+    else if(a=="--xyz_scale") nextf(g_v.xyz_scale);
+    else if(a=="--raw_intensity") g_v.norm_intensity=false;
+    else if(a=="--radius") nextf(g_v.cam_radius);
+    else if(a=="--height") nextf(g_v.cam_height);
+    else if(a=="--spin_dps") nextf(g_v.spin_deg_per_s);
+    else if(a=="--point_px") nexti(g_v.point_px);
+    else if(a=="--color_height") g_v.color_by_height=true;
+    else if(a=="--color_intensity") g_v.color_by_height=false;
+    else if(a=="--z_min") nextf(g_v.z_min);
+    else if(a=="--z_max") nextf(g_v.z_max);
+    else if(a=="--gamma") nextf(g_v.gamma);
+    else if(a=="--no_autofit") g_v.autofit=false;
+    // top-view
+    else if(a=="--topview_on") { int v; nexti(v); g_v.topview_on=(v!=0); }
+    else if(a=="--top_xmin") nextf(g_v.top_xmin);
+    else if(a=="--top_xmax") nextf(g_v.top_xmax);
+    else if(a=="--top_ymin") nextf(g_v.top_ymin);
+    else if(a=="--top_ymax") nextf(g_v.top_ymax);
+    else if(a=="--top_ppm")  nexti(g_v.top_ppm);
+    else if(a=="--top_point_px") nexti(g_v.top_point_px);
+    else if(a=="--top_color_height") g_v.top_color_by_height = true;
+    else if(a=="--top_color_intensity") g_v.top_color_by_height = false;
+    else if(a=="--top_zmin") nextf(g_v.top_zmin);
+    else if(a=="--top_zmax") nextf(g_v.top_zmax);
+    else if(a=="--top_gamma") nextf(g_v.top_gamma);
+    // inference
+    else if(a=="--onnx") nexts(g_v.onnx_path);
+    else if(a=="--infer_hz") nexti(g_v.infer_hz);
+    else if(a=="--roi_xmin") nextf(g_v.roi_xmin);
+    else if(a=="--roi_xmax") nextf(g_v.roi_xmax);
+    else if(a=="--roi_ymin") nextf(g_v.roi_ymin);
+    else if(a=="--roi_ymax") nextf(g_v.roi_ymax);
+    else if(a=="--roi_zmin") nextf(g_v.roi_zmin);
+    else if(a=="--roi_zmax") nextf(g_v.roi_zmax);
+    else if(a=="-h"||a=="--help"){
+      std::cout <<
+      "Options:\n"
+      "  --out_dir out_frames  --fps 30  --w 1280  --h 720  --fov_deg 40\n"
+      "  --accum_ms 600        --duration_s 0      --xyz_scale 0.001  --raw_intensity\n"
+      "  --radius 3.5          --height 1.6        --spin_dps 12      --no_autofit\n"
+      "  --point_px 3          --color_height|--color_intensity  --z_min -1 --z_max 2  --gamma 0.7\n"
+      "  --topview_on 1        --top_xmin -30 --top_xmax 30 --top_ymin -30 --top_ymax 30 --top_ppm 40\n"
+      "  --top_point_px 2      --top_color_height|--top_color_intensity  --top_zmin -1 --top_zmax 2  --top_gamma 0.7\n"
+      "  --onnx ./model/pointpillar.onnx  --infer_hz 10\n"
+      "  --roi_xmin 0 --roi_xmax 70 --roi_ymin -40 --roi_ymax 40 --roi_zmin -3 --roi_zmax 1\n";
+      std::exit(0);
+    }
+  }
+}
+
+// ========== main ==========
+int main(int argc, char** argv){
+  std::signal(SIGINT, SigInt);
+  parse_args(argc, argv);
+
+  if (!ensure_dir(g_v.out_dir)) {
+    std::cerr << "Failed to create dir: " << g_v.out_dir << "\n";
+    return -1;
+  }
+
+  // Livox 시작
+  if (!Init()) { std::cerr << "Init() failed\n"; return -1; }
+  SetBroadcastCallback(OnBroadcast);
+  SetDeviceStateUpdateCallback(OnDeviceChange);
+  if (!Start()) { std::cerr << "Start() failed\n"; Uninit(); return -1; }
+
+  std::fprintf(stderr, "[RUN] Mid-70 visualize → %s (%dx%d@%dfps)"
+                   " accum=%dms fov=%.1f point_px=%d color=%s  topview=%s  "
+                   "ROI[x:%.1f..%.1f y:%.1f..%.1f z:%.1f..%.1f]  infer=%dHz\n",
+               g_v.out_dir.c_str(), g_v.width, g_v.height, g_v.fps,
+               g_v.accum_ms, g_v.fov_deg, g_v.point_px,
+               (g_v.color_by_height?"height":"intensity"),
+               (g_v.topview_on?"on":"off"),
+               g_v.roi_xmin,g_v.roi_xmax,g_v.roi_ymin,g_v.roi_ymax,g_v.roi_zmin,g_v.roi_zmax,
+               g_v.infer_hz);
+
+  // 추론 스레드 가동
+  std::thread infer_thr(infer_thread_fn);
+
+  auto t0 = Clock::now();
+  double yaw = 0.0;
+  const double dt = 1.0 / std::max(1, g_v.fps);
+  int frame_idx = 0;
+
+  // --- 실시간 3D 뷰 루프 ---
+  cv::namedWindow("Livox-3D", cv::WINDOW_NORMAL);
+  cv::resizeWindow("Livox-3D", g_v.width, g_v.height);
+  if (g_v.topview_on) cv::namedWindow("Top-View", cv::WINDOW_NORMAL);
+
+  bool  spin_on   = (g_v.spin_deg_per_s > 0.0);
+  double fps_ema  = 0.0;
+  auto   tick_prev = Clock::now();
+
+  while (g_run.load()) {
+    auto el = std::chrono::duration_cast<std::chrono::seconds>(Clock::now()-t0).count();
+    if (g_v.duration_s > 0 && el >= g_v.duration_s) break;
+
+    // 스냅샷
+    std::vector<TimedPt> pts;
+    {
+      std::lock_guard<std::mutex> lk(g_mtx);
+      pts.assign(g_buf.begin(), g_buf.end());
+    }
+
+    // 렌더
+    std::vector<uint8_t> rgb;
+    render_perspective_to_rgb(pts, float(yaw), g_v.width, g_v.height, g_v.fov_deg, rgb);
+
+    std::vector<uint8_t> top_rgb;
+    int TW = 0, TH = 0;
+    if (g_v.topview_on) render_topdown_to_rgb(pts, top_rgb, TW, TH);
+
+    // 표시 + 오버레이
+    cv::Mat imgRGB(g_v.height, g_v.width, CV_8UC3, rgb.data());
+    cv::Mat imgBGR; cv::cvtColor(imgRGB, imgBGR, cv::COLOR_RGB2BGR);
+
+    auto   tick_now = Clock::now();
+    double dt_s     = std::chrono::duration<double>(tick_now - tick_prev).count();
+    tick_prev       = tick_now;
+    double fps_inst = (dt_s > 1e-6) ? 1.0/dt_s : 0.0;
+    fps_ema         = (fps_ema == 0.0) ? fps_inst : fps_ema*0.9 + fps_inst*0.1;
+
+    char info[256];
+    std::snprintf(info, sizeof(info),
+      "fps=%.1f  pts=%zu  yaw=%.1f  fov=%.1f  px=%d  acc=%dms  mode=%s  boxes=%s",
+      fps_ema, pts.size(), yaw, g_v.fov_deg, g_v.point_px, g_v.accum_ms,
+      (g_v.color_by_height ? "height" : "intensity"),
+      (g_v.draw_boxes ? "on" : "off"));
+    cv::putText(imgBGR, info, {12,24}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {0,255,0}, 1, cv::LINE_AA);
+    cv::putText(imgBGR, "Keys: A/D yaw  E/R zoom  1/2 size  [/ ] accum  C color  B boxes  SPACE spin  S save  Q/ESC quit",
+                {12, std::max(28, g_v.height-14)}, cv::FONT_HERSHEY_SIMPLEX, 0.5, {255,255,255}, 1, cv::LINE_AA);
+
+    cv::imshow("Livox-3D", imgBGR);
+
+    if (g_v.topview_on && TW > 0 && TH > 0) {
+      cv::Mat topRGB(TH, TW, CV_8UC3, top_rgb.data());
+      cv::Mat topBGR; cv::cvtColor(topRGB, topBGR, cv::COLOR_RGB2BGR);
+      if (g_v.draw_boxes) draw_boxes_topview(topBGR, TW, TH);
+      cv::imshow("Top-View", topBGR);
+    }
+
+    // 키 입력
+    int key = cv::waitKey(1);
+    if (key == 27 || key == 'q' || key == 'Q') { g_run.store(false); break; }
+    else if (key == 'a' || key == 'A') yaw -= 3.0;
+    else if (key == 'd' || key == 'D') yaw += 3.0;
+    else if (key == 'e' || key == 'E') g_v.fov_deg = std::max(20.f,  g_v.fov_deg - 2.f);
+    else if (key == 'r' || key == 'R') g_v.fov_deg = std::min(100.f, g_v.fov_deg + 2.f);
+    else if (key == '1') g_v.point_px = std::max(1, g_v.point_px - 1);
+    else if (key == '2') g_v.point_px = std::min(8, g_v.point_px + 1);
+    else if (key == '[') g_v.accum_ms = std::max(50,   g_v.accum_ms - 50);
+    else if (key == ']') g_v.accum_ms = std::min(1000, g_v.accum_ms + 50);
+    else if (key == 'c' || key == 'C') g_v.color_by_height = !g_v.color_by_height;
+    else if (key == 'b' || key == 'B') g_v.draw_boxes = !g_v.draw_boxes;
+    else if (key == ' ') spin_on = !spin_on;
+    else if (key == 's' || key == 'S') {
+      char name[256];
+      std::snprintf(name, sizeof(name), "%s/frame_%06d.ppm", g_v.out_dir.c_str(), frame_idx);
+      if (save_ppm(name, g_v.width, g_v.height, rgb))
+        std::fprintf(stderr, "[SAVE] %s\n", name);
+    }
+
+    if (spin_on) yaw += g_v.spin_deg_per_s * dt;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(int(1000.0 * dt)));
+    ++frame_idx;
+  }
+
+  g_run.store(false);
+  if (infer_thr.joinable()) infer_thr.join();
+
+  Uninit();
+  std::fprintf(stderr, "[DONE] frames in '%s'\n", g_v.out_dir.c_str());
+  return 0;
+}
